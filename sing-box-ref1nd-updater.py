@@ -347,15 +347,15 @@ def install_binary(binary: Path, install_path: Path, backup: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Update sing-box reF1nd from Telegram releases")
-    parser.add_argument("--track", choices=("stable", "testing"), default="stable")
-    parser.add_argument("--arch", choices=("auto", "arm64", "amd64v3", "amd64"), default="auto")
-    parser.add_argument("--build", choices=("purego", "musl", "glibc"), default="glibc")
-    parser.add_argument("--channel", default=CHANNEL, help="Telegram channel name or https://t.me/... URL")
-    parser.add_argument("--install-path", default=INSTALL_PATH)
+    parser.add_argument("--track", choices=("stable", "testing"), default=None)
+    parser.add_argument("--arch", choices=("auto", "arm64", "amd64v3", "amd64"), default=None)
+    parser.add_argument("--build", choices=("purego", "musl", "glibc"), default=None)
+    parser.add_argument("--channel", default=None, help="Telegram channel name or https://t.me/... URL")
+    parser.add_argument("--install-path", default=None)
     parser.add_argument("--max-pages", type=int, default=5, help="Telegram search result pages to scan")
     parser.add_argument("--api-id", help="Telegram API ID; can also use TELEGRAM_API_ID")
     parser.add_argument("--api-hash", help="Telegram API hash; can also use TELEGRAM_API_HASH")
-    parser.add_argument("--session", default=SESSION_PATH, help="Telethon session file")
+    parser.add_argument("--session", default=None, help="Telethon session file")
     parser.add_argument("--config", default=None, help=f"config file path (default: {CONFIG_PATH})")
     parser.add_argument("--force", action="store_true", help="download and install even when not newer")
     parser.add_argument("--dry-run", action="store_true", help="check only; do not download or install")
@@ -369,7 +369,7 @@ def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
     channel = normalize_channel(_first_nonempty(args.channel, cfg.get("channel"), CHANNEL) or CHANNEL)
-    arch = args.arch if args.arch != "auto" else (cfg.get("arch") or "auto")
+    arch = _first_nonempty(args.arch, cfg.get("arch")) or "auto"
     arch = detect_arch() if arch == "auto" else arch
     build = _first_nonempty(args.build, cfg.get("build")) or "glibc"
     track = _first_nonempty(args.track, cfg.get("track")) or "stable"
