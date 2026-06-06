@@ -235,7 +235,11 @@ async def download_with_telethon(
     try:
         from telethon import TelegramClient  # type: ignore
     except ImportError:
-        fail("Telethon is required for download: python3 -m pip install telethon")
+        fail(
+            "Telethon is required for download.\n"
+            "  pip:      python3 -m pip install telethon\n"
+            "  Debian/Ubuntu: sudo apt install python3-telethon"
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     client = TelegramClient(session, int(api_id), api_hash)
