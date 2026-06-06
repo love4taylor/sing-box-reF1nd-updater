@@ -54,7 +54,7 @@ sudo ./sing-box-ref1nd-updater.py --track testing --arch amd64v3 --build musl
 | `--config` | `~/.config/sing-box-ref1nd-updater/config.json` | Config file path |
 | `--channel` | `sing_box_reF1nd` | Telegram channel |
 | `--install-path` | `/usr/bin/sing-box` | Target binary path |
-| `--session` | `sing_box_ref1nd.session` | Telethon session file |
+| `--session` | `~/.config/sing-box-ref1nd-updater/session` | Telethon session file |
 | `--dry-run` | — | Check only, no download |
 | `--list` | — | List matching assets and exit |
 | `--force` | — | Install even if not newer |

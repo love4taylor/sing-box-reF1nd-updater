@@ -33,11 +33,12 @@ from typing import Any, Iterable
 CHANNEL = "sing_box_reF1nd"
 INSTALL_PATH = "/usr/bin/sing-box"
 USER_AGENT = "Mozilla/5.0 sing-box-reF1nd-updater/1.0"
-CONFIG_PATH = os.path.join(
+CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "sing-box-ref1nd-updater",
-    "config.json",
 )
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+SESSION_PATH = os.path.join(CONFIG_DIR, "session")
 
 ASSET_RE = re.compile(
     r"^sing-box-(?P<version>.+?)-reF1nd-linux-"
@@ -354,7 +355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=5, help="Telegram search result pages to scan")
     parser.add_argument("--api-id", help="Telegram API ID; can also use TELEGRAM_API_ID")
     parser.add_argument("--api-hash", help="Telegram API hash; can also use TELEGRAM_API_HASH")
-    parser.add_argument("--session", default="sing_box_ref1nd.session", help="Telethon session file")
+    parser.add_argument("--session", default=SESSION_PATH, help="Telethon session file")
     parser.add_argument("--config", default=None, help=f"config file path (default: {CONFIG_PATH})")
     parser.add_argument("--force", action="store_true", help="download and install even when not newer")
     parser.add_argument("--dry-run", action="store_true", help="check only; do not download or install")
@@ -375,7 +376,7 @@ def main() -> int:
     install_path = Path(_first_nonempty(args.install_path, cfg.get("install_path")) or INSTALL_PATH)
     api_id = _first_nonempty(args.api_id, cfg.get("api_id"), os.environ.get("TELEGRAM_API_ID"))
     api_hash = _first_nonempty(args.api_hash, cfg.get("api_hash"), os.environ.get("TELEGRAM_API_HASH"))
-    session = _first_nonempty(args.session, cfg.get("session")) or "sing_box_ref1nd.session"
+    session = _first_nonempty(args.session, cfg.get("session")) or SESSION_PATH
 
     log(f"Scanning @{channel} #{track} for linux-{arch}-{build} ...")
     assets = discover_assets(channel, track, args.max_pages)
