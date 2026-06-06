@@ -98,7 +98,7 @@ def normalize_channel(channel: str) -> str:
     return channel
 
 
-V3_FLAGS = {"avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"}
+V3_FLAGS = {"avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "osxsave"}
 
 
 def detect_arch() -> str:
