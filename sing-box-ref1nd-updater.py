@@ -233,6 +233,33 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
         fail(f"failed to read config file {path}: {exc}")
 
 
+def write_config(data: dict[str, Any], config_path: str | None = None) -> None:
+    path = Path(config_path or CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("w") as fh:
+            json.dump(data, fh, indent=4)
+            fh.write("\n")
+    except OSError as exc:
+        fail(f"failed to write config file {path}: {exc}")
+
+
+def prompt_api_credentials() -> tuple[str, str]:
+    print("Telegram API credentials are required for downloading files from Telegram.")
+    print("Get them at https://my.telegram.org/apps")
+    try:
+        api_id = input("API ID: ").strip()
+        api_hash = input("API hash: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        fail("aborted")
+    if not api_id or not api_hash:
+        fail("API ID and hash are required")
+    if not api_id.isdigit():
+        fail("API ID must be a number")
+    return api_id, api_hash
+
+
 def _first_nonempty(*values: str | None) -> str | None:
     for v in values:
         if v:
@@ -368,6 +395,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
+    config_path = Path(args.config or CONFIG_PATH)
     channel = normalize_channel(_first_nonempty(args.channel, cfg.get("channel"), CHANNEL) or CHANNEL)
     arch = _first_nonempty(args.arch, cfg.get("arch")) or "auto"
     arch = detect_arch() if arch == "auto" else arch
@@ -377,6 +405,31 @@ def main() -> int:
     api_id = _first_nonempty(args.api_id, cfg.get("api_id"), os.environ.get("TELEGRAM_API_ID"))
     api_hash = _first_nonempty(args.api_hash, cfg.get("api_hash"), os.environ.get("TELEGRAM_API_HASH"))
     session = _first_nonempty(args.session, cfg.get("session")) or SESSION_PATH
+
+    need_credentials = not args.list and not args.dry_run and (not api_id or not api_hash)
+    if need_credentials:
+        api_id_str, api_hash = prompt_api_credentials()
+        api_id = api_id_str
+
+    resolved = {
+        "api_id": api_id,
+        "api_hash": api_hash,
+        "track": track,
+        "arch": arch,
+        "build": build,
+    }
+    should_save = (
+        need_credentials
+        or not config_path.is_file()
+        or (not args.list and not args.dry_run)
+    )
+    config_changed = not config_path.is_file() or any(
+        str(resolved.get(k)) != str(cfg.get(k)) for k in resolved
+    )
+    if should_save and config_changed:
+        merged = {**cfg, **{k: v for k, v in resolved.items() if v}}
+        write_config(merged, str(config_path))
+        log(f"Config saved to {config_path}")
 
     log(f"Scanning @{channel} #{track} for linux-{arch}-{build} ...")
     assets = discover_assets(channel, track, args.max_pages)
