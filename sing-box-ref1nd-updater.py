@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import functools
 import html
+import json
 import os
 import platform
 import re
@@ -26,12 +27,17 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 CHANNEL = "sing_box_reF1nd"
 INSTALL_PATH = "/usr/bin/sing-box"
 USER_AGENT = "Mozilla/5.0 sing-box-reF1nd-updater/1.0"
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "sing-box-ref1nd-updater",
+    "config.json",
+)
 
 ASSET_RE = re.compile(
     r"^sing-box-(?P<version>.+?)-reF1nd-linux-"
@@ -215,6 +221,24 @@ def current_version(binary: Path) -> str | None:
     return version.removesuffix("-reF1nd")
 
 
+def load_config(config_path: str | None = None) -> dict[str, Any]:
+    path = Path(config_path or CONFIG_PATH)
+    if not path.is_file():
+        return {}
+    try:
+        with path.open() as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        fail(f"failed to read config file {path}: {exc}")
+
+
+def _first_nonempty(*values: str | None) -> str | None:
+    for v in values:
+        if v:
+            return v
+    return None
+
+
 async def download_with_telethon(
     channel: str,
     asset: Asset,
@@ -229,8 +253,11 @@ async def download_with_telethon(
         api_hash = os.environ.get("TELEGRAM_API_HASH")
     if not api_id or not api_hash:
         fail(
-            "download requires Telegram API credentials; set TELEGRAM_API_ID "
-            "and TELEGRAM_API_HASH or pass --api-id/--api-hash"
+            "download requires Telegram API credentials.\n"
+            "  Set them in ~/.config/sing-box-ref1nd-updater/config.json:\n"
+            '    {"api_id": 12345, "api_hash": "your_hash"}\n'
+            "  Or use env vars: TELEGRAM_API_ID / TELEGRAM_API_HASH\n"
+            "  Or pass --api-id / --api-hash"
         )
     try:
         from telethon import TelegramClient  # type: ignore
@@ -328,6 +355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-id", help="Telegram API ID; can also use TELEGRAM_API_ID")
     parser.add_argument("--api-hash", help="Telegram API hash; can also use TELEGRAM_API_HASH")
     parser.add_argument("--session", default="sing_box_ref1nd.session", help="Telethon session file")
+    parser.add_argument("--config", default=None, help=f"config file path (default: {CONFIG_PATH})")
     parser.add_argument("--force", action="store_true", help="download and install even when not newer")
     parser.add_argument("--dry-run", action="store_true", help="check only; do not download or install")
     parser.add_argument("--list", action="store_true", help="list matching assets and exit")
@@ -338,14 +366,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    channel = normalize_channel(args.channel)
-    arch = detect_arch() if args.arch == "auto" else args.arch
-    install_path = Path(args.install_path)
+    cfg = load_config(args.config)
+    channel = normalize_channel(_first_nonempty(args.channel, cfg.get("channel"), CHANNEL) or CHANNEL)
+    arch = args.arch if args.arch != "auto" else (cfg.get("arch") or "auto")
+    arch = detect_arch() if arch == "auto" else arch
+    build = _first_nonempty(args.build, cfg.get("build")) or "glibc"
+    track = _first_nonempty(args.track, cfg.get("track")) or "stable"
+    install_path = Path(_first_nonempty(args.install_path, cfg.get("install_path")) or INSTALL_PATH)
+    api_id = _first_nonempty(args.api_id, cfg.get("api_id"), os.environ.get("TELEGRAM_API_ID"))
+    api_hash = _first_nonempty(args.api_hash, cfg.get("api_hash"), os.environ.get("TELEGRAM_API_HASH"))
+    session = _first_nonempty(args.session, cfg.get("session")) or "sing_box_ref1nd.session"
 
-    log(f"Scanning @{channel} #{args.track} for linux-{arch}-{args.build} ...")
-    assets = discover_assets(channel, args.track, args.max_pages)
+    log(f"Scanning @{channel} #{track} for linux-{arch}-{build} ...")
+    assets = discover_assets(channel, track, args.max_pages)
     matching = sorted(
-        [a for a in assets if a.arch == arch and a.build == args.build],
+        [a for a in assets if a.arch == arch and a.build == build],
         key=functools.cmp_to_key(lambda a, b: compare_versions(a.version, b.version)),
         reverse=True,
     )
@@ -354,9 +389,9 @@ def main() -> int:
             print(f"{asset.version}\t{asset.filename}\t{asset.message_url}")
         return 0
 
-    asset = latest_asset(assets, args.track, arch, args.build)
+    asset = latest_asset(assets, track, arch, build)
     if not asset:
-        fail(f"no matching {args.track} linux-{arch}-{args.build} asset found")
+        fail(f"no matching {track} linux-{arch}-{build} asset found")
 
     installed = current_version(install_path)
     log(f"Latest:   {asset.version} ({asset.filename})")
@@ -378,7 +413,7 @@ def main() -> int:
         archive_path = tmpdir / asset.filename
         log(f"Downloading: {asset.message_url}")
         downloaded = asyncio.run(
-            download_with_telethon(channel, asset, archive_path, args.api_id, args.api_hash, args.session)
+            download_with_telethon(channel, asset, archive_path, api_id, api_hash, session)
         )
         binary_path = tmpdir / "sing-box"
         extract_binary(downloaded, binary_path)
