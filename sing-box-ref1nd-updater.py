@@ -98,12 +98,26 @@ def normalize_channel(channel: str) -> str:
     return channel
 
 
+V3_FLAGS = {"avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe"}
+
+
 def detect_arch() -> str:
     machine = platform.machine().lower()
     if machine in {"aarch64", "arm64"}:
         return "arm64"
     if machine in {"x86_64", "amd64"}:
-        # amd64 is the safe default. Choose amd64v3 explicitly if desired.
+        try:
+            with open("/proc/cpuinfo") as fh:
+                flags_line = ""
+                for line in fh:
+                    if line.startswith("flags"):
+                        flags_line = line
+                        break
+                flags = set(flags_line.partition(":")[2].strip().lower().split())
+        except (OSError, IOError):
+            flags = set()
+        if V3_FLAGS <= flags:
+            return "amd64v3"
         return "amd64"
     fail(f"cannot auto-detect supported architecture from {machine!r}")
 
