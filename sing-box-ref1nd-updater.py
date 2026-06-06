@@ -242,7 +242,12 @@ async def download_with_telethon(
         )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(session, int(api_id), api_hash)
+    client = TelegramClient(
+        session, int(api_id), api_hash,
+        device_model="sing-box-ref1nd-updater",
+        system_version="Linux",
+        app_version="1.0",
+    )
     await client.start()
     try:
         entity = await client.get_entity(channel)
