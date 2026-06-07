@@ -18,7 +18,7 @@ Create `~/.config/sing-box-ref1nd-updater/config.json`:
     "api_hash": "your_hash_here",
     "track": "stable",
     "arch": "amd64",
-    "build": "glibc"
+    "build": "musl"
 }
 ```
 
@@ -50,7 +50,7 @@ sudo ./sing-box-ref1nd-updater.py --track testing --arch amd64v3 --build musl
 |---|---|---|
 | `--track` | `stable` | `stable` or `testing` |
 | `--arch` | `auto` | `arm64`, `amd64v3`, `amd64` |
-| `--build` | `glibc` | `purego`, `musl`, `glibc` |
+| `--build` | `musl` | `purego`, `musl`, `glibc` |
 | `--config` | `~/.config/sing-box-ref1nd-updater/config.json` | Config file path |
 | `--channel` | `sing_box_reF1nd` | Telegram channel |
 | `--install-path` | `/usr/bin/sing-box` | Target binary path |
