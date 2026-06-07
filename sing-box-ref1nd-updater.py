@@ -413,7 +413,7 @@ def main() -> int:
     channel = normalize_channel(_first_nonempty(args.channel, cfg.get("channel"), CHANNEL) or CHANNEL)
     arch = _first_nonempty(args.arch, cfg.get("arch")) or "auto"
     arch = detect_arch() if arch == "auto" else arch
-    build = _first_nonempty(args.build, cfg.get("build")) or "glibc"
+    build = _first_nonempty(args.build, cfg.get("build")) or "musl"
     track = _first_nonempty(args.track, cfg.get("track")) or "stable"
     install_path = Path(_first_nonempty(args.install_path, cfg.get("install_path")) or INSTALL_PATH)
     api_id = _first_nonempty(args.api_id, cfg.get("api_id"), os.environ.get("TELEGRAM_API_ID"))
