@@ -32,6 +32,7 @@ from typing import Any, Iterable
 
 CHANNEL = "sing_box_reF1nd"
 INSTALL_PATH = "/usr/bin/sing-box"
+CRONET_LIB_PATH = "/usr/local/lib/cronet-go/"
 USER_AGENT = "Mozilla/5.0 sing-box-reF1nd-updater/1.0"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
@@ -334,7 +335,8 @@ async def download_with_telethon(
     return Path(downloaded)
 
 
-def extract_binary(archive: Path, output: Path) -> None:
+def extract_binary(archive: Path, output: Path) -> tuple[Path, Path | None]:
+    cronet_output: Path | None = None
     try:
         with tarfile.open(archive, "r:gz") as tar:
             members = [m for m in tar.getmembers() if m.isfile() and Path(m.name).name == "sing-box"]
@@ -346,9 +348,20 @@ def extract_binary(archive: Path, output: Path) -> None:
                 fail("failed to read sing-box binary from archive")
             with output.open("wb") as dst:
                 shutil.copyfileobj(source, dst)
+            cronet_members = [m for m in tar.getmembers() if m.isfile() and Path(m.name).name == "libcronet.so"]
+            if len(cronet_members) == 1:
+                cronet_source = tar.extractfile(cronet_members[0])
+                if cronet_source is not None:
+                    cronet_output = output.parent / "libcronet.so"
+                    with cronet_output.open("wb") as dst:
+                        shutil.copyfileobj(cronet_source, dst)
+                    cronet_output.chmod(0o644)
+            elif len(cronet_members) > 1:
+                fail("multiple libcronet.so found in archive")
     except tarfile.TarError as exc:
         fail(f"failed to unpack {archive}: {exc}")
     output.chmod(0o755)
+    return output, cronet_output
 
 
 def verify_binary(binary: Path, expected_version: str) -> None:
@@ -376,6 +389,23 @@ def install_binary(binary: Path, install_path: Path, backup: bool) -> None:
         if backup and install_path.exists():
             backup_path = install_dir / f"{install_path.name}.bak"
             shutil.copy2(install_path, backup_path)
+        os.replace(tmp_target, install_path)
+    except PermissionError:
+        fail(f"permission denied installing to {install_path}; run with sudo/root")
+    finally:
+        try:
+            tmp_target.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def install_library(library: Path, install_path: Path) -> None:
+    install_dir = install_path.parent
+    install_dir.mkdir(parents=True, exist_ok=True)
+    tmp_target = install_dir / f".{install_path.name}.new.{os.getpid()}"
+    try:
+        shutil.copy2(library, tmp_target)
+        tmp_target.chmod(0o644)
         os.replace(tmp_target, install_path)
     except PermissionError:
         fail(f"permission denied installing to {install_path}; run with sudo/root")
@@ -484,10 +514,13 @@ def main() -> int:
             download_with_telethon(channel, asset, archive_path, api_id, api_hash, session)
         )
         binary_path = tmpdir / "sing-box"
-        extract_binary(downloaded, binary_path)
+        _, libcronet_path = extract_binary(downloaded, binary_path)
         if not args.skip_verify_binary:
             verify_binary(binary_path, asset.version)
         install_binary(binary_path, install_path, backup=not args.no_backup)
+        if libcronet_path is not None:
+            install_library(libcronet_path, Path(CRONET_LIB_PATH) / "libcronet.so")
+            log(f"Installed libcronet.so to {CRONET_LIB_PATH}")
 
     log(f"Installed {asset.version} to {install_path}")
     return 0
