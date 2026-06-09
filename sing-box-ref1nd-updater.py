@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""Update sing-box reF1nd builds published in a Telegram channel.
-
-Discovery uses Telegram's public web preview. Actual Telegram file download
-requires a normal Telegram API session via Telethon because public preview pages
-do not expose stable direct archive URLs.
-"""
+"""Update sing-box reF1nd builds from GitHub Releases."""
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import functools
-import html
 import json
 import os
 import platform
+import pwd
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -23,34 +18,50 @@ import sys
 import tarfile
 import tempfile
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-
-CHANNEL = "sing_box_reF1nd"
-INSTALL_PATH = "/usr/bin/sing-box"
+REPO = "reF1nd/sing-box-releases"
+INSTALL_PATH = "/usr/local/bin/sing-box-ref1nd"
 CRONET_LIB_PATH = "/usr/local/lib/cronet-go/"
-USER_AGENT = "Mozilla/5.0 sing-box-reF1nd-updater/1.0"
+USER_AGENT = "sing-box-reF1nd-updater/2.0"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "sing-box-ref1nd-updater",
 )
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-SESSION_PATH = os.path.join(CONFIG_DIR, "session")
+
+SERVICE_USER = "sing-box-ref1nd"
+SERVICE_SHELL = "/usr/sbin/nologin"
+SERVICE_STATE_DIR = "/var/lib/sing-box-ref1nd"
+SERVICE_CONFIG_DIR = "/usr/local/etc/sing-box-ref1nd"
+SERVICE_UNIT = "/etc/systemd/system/sing-box-ref1nd.service"
+SERVICE_TEMPLATE = "/etc/systemd/system/sing-box-ref1nd@.service"
+
+DEFAULT_SINGBOX_CONFIG = {
+    "log": {"level": "info"},
+    "dns": {
+        "servers": [{"type": "tls", "tag": "google", "server": "8.8.8.8"}]
+    },
+    "inbounds": [
+        {
+            "type": "snell",
+            "listen": "::",
+            "listen_port": 0,
+            "psk": "",
+            "version": 5,
+        }
+    ],
+    "outbounds": [{"type": "direct"}],
+    "route": {"rules": [{"port": 53, "action": "hijack-dns"}]},
+}
 
 ASSET_RE = re.compile(
     r"^sing-box-(?P<version>.+?)-reF1nd-linux-"
     r"(?P<arch>arm64|amd64v3|amd64)-(?P<build>purego|musl|glibc)\.tar\.gz$"
 )
-DOC_RE = re.compile(
-    r'<a class="tgme_widget_message_document_wrap" href="(?P<href>[^"]+)">.*?'
-    r'<div class="tgme_widget_message_document_title[^>]*>(?P<title>.*?)</div>',
-    re.S,
-)
-MORE_RE = re.compile(r'data-before="(?P<before>\d+)"')
 CURRENT_VERSION_RE = re.compile(r"sing-box\s+version\s+(?P<version>\S+)")
 SEMVER_RE = re.compile(
     r"^(?P<major>\d+)"
@@ -58,6 +69,7 @@ SEMVER_RE = re.compile(
     r"(?:\.(?P<patch>\d+))?"
     r"(?:-(?P<pre>[0-9A-Za-z.-]+))?$"
 )
+TESTING_RE = re.compile(r"\b(alpha|beta|rc)\b")
 
 
 @dataclass(frozen=True)
@@ -66,8 +78,8 @@ class Asset:
     version: str
     arch: str
     build: str
-    message_id: int
-    message_url: str
+    download_url: str
+    release_url: str
 
 
 def log(message: str) -> None:
@@ -79,24 +91,39 @@ def fail(message: str, exit_code: int = 1) -> None:
     raise SystemExit(exit_code)
 
 
-def request_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def request_json(url: str, token: str | None = None) -> Any:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        if exc.code == 403 and "rate limit" in body.lower():
+            fail(
+                "GitHub API rate limit exceeded.\n"
+                "  Provide a token via --token, $GITHUB_TOKEN, or the config file."
+            )
+        if exc.code == 401:
+            fail("GitHub API authentication failed. Check your token.")
+        fail(f"GitHub API error {exc.code}: {exc.reason}")
     except urllib.error.URLError as exc:
         fail(f"failed to fetch {url}: {exc}")
 
 
-def normalize_channel(channel: str) -> str:
-    channel = channel.strip()
-    if channel.startswith("https://t.me/"):
-        channel = channel.removeprefix("https://t.me/").strip("/")
-    if channel.startswith("@"):
-        channel = channel[1:]
-    if not re.fullmatch(r"[A-Za-z0-9_]+", channel):
-        fail(f"invalid Telegram channel: {channel}")
-    return channel
+def normalize_repo(repo: str) -> str:
+    repo = repo.strip()
+    if repo.startswith("https://github.com/"):
+        repo = repo.removeprefix("https://github.com/").strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        fail(f"invalid GitHub repository: {repo}")
+    return repo
 
 
 V3_FLAGS = {"avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "osxsave"}
@@ -123,55 +150,61 @@ def detect_arch() -> str:
     fail(f"cannot auto-detect supported architecture from {machine!r}")
 
 
-def parse_asset(channel: str, title: str, href: str) -> Asset | None:
-    filename = html.unescape(re.sub(r"<.*?>", "", title)).strip()
-    match = ASSET_RE.match(filename)
-    if not match:
-        return None
-    id_match = re.search(r"/(\d+)(?:\?|$)", html.unescape(href))
-    if not id_match:
-        return None
-    message_id = int(id_match.group(1))
-    return Asset(
-        filename=filename,
-        version=match.group("version"),
-        arch=match.group("arch"),
-        build=match.group("build"),
-        message_id=message_id,
-        message_url=f"https://t.me/{channel}/{message_id}",
-    )
+def discover_assets(repo: str, max_pages: int, token: str | None = None) -> list[Asset]:
+    seen: dict[tuple[str, str, str], Asset] = {}
+    per_page = 100
+    for page in range(1, max_pages + 1):
+        url = f"https://api.github.com/repos/{repo}/releases?per_page={per_page}&page={page}"
+        releases = request_json(url, token)
+        if not releases:
+            break
+        for release in releases:
+            if release.get("draft"):
+                continue
+            release_url = release.get("html_url", "")
+            for asset_data in release.get("assets", []):
+                filename = asset_data["name"]
+                match = ASSET_RE.match(filename)
+                if not match:
+                    continue
+                key = (
+                    match.group("version"),
+                    match.group("arch"),
+                    match.group("build"),
+                )
+                if key not in seen:
+                    seen[key] = Asset(
+                        filename=filename,
+                        version=match.group("version"),
+                        arch=match.group("arch"),
+                        build=match.group("build"),
+                        download_url=asset_data["browser_download_url"],
+                        release_url=release_url,
+                    )
+    return list(seen.values())
 
 
-def discover_assets(channel: str, track: str, max_pages: int) -> list[Asset]:
-    assets: dict[str, Asset] = {}
-    before: str | None = None
-    for _ in range(max_pages):
-        query = urllib.parse.urlencode({"q": f"#{track}"})
-        url = f"https://t.me/s/{channel}?{query}"
-        if before:
-            url += f"&before={urllib.parse.quote(before)}"
-        page = request_text(url)
-        for match in DOC_RE.finditer(page):
-            asset = parse_asset(channel, match.group("title"), match.group("href"))
-            if asset:
-                assets[asset.filename] = asset
-        more = MORE_RE.search(page)
-        if not more:
-            break
-        next_before = more.group("before")
-        if next_before == before:
-            break
-        before = next_before
-    return list(assets.values())
+def download_asset(asset: Asset, destination: Path, token: str | None = None) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": USER_AGENT}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(asset.download_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            with destination.open("wb") as dst:
+                shutil.copyfileobj(resp, dst)
+    except urllib.error.URLError as exc:
+        fail(f"failed to download {asset.filename}: {exc}")
+    return destination
 
 
 def semver_key(version: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
     match = SEMVER_RE.match(version)
     if not match:
-        # Fallback keeps unknown versions comparable and deterministic.
         nums = tuple(int(x) for x in re.findall(r"\d+", version)[:3])
         nums = nums + (0,) * (3 - len(nums))
-        return (nums[:3], tuple(version.split("-", 1)[1:]) or None)  # type: ignore[return-value]
+        return (nums[:3], tuple(version.split("-", 1)[1:]) or None)
     main = (
         int(match.group("major")),
         int(match.group("minor") or 0),
@@ -215,16 +248,18 @@ def compare_versions(left: str, right: str) -> int:
 def latest_asset(assets: Iterable[Asset], track: str, arch: str, build: str) -> Asset | None:
     filtered = [a for a in assets if a.arch == arch and a.build == build]
     if track == "stable":
-        filtered = [a for a in filtered if "-" not in a.version]
+        filtered = [a for a in filtered if not TESTING_RE.search(a.version)]
     else:
-        filtered = [a for a in filtered if "-" in a.version]
+        filtered = [a for a in filtered if TESTING_RE.search(a.version)]
     if not filtered:
         return None
     return max(filtered, key=functools.cmp_to_key(lambda a, b: compare_versions(a.version, b.version)))
 
 
 def current_version(binary: Path) -> str | None:
-    command = [str(binary), "version"] if binary.exists() else ["sing-box", "version"]
+    if not binary.exists():
+        return None
+    command = [str(binary), "version"]
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
     except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
@@ -257,82 +292,6 @@ def write_config(data: dict[str, Any], config_path: str | None = None) -> None:
             fh.write("\n")
     except OSError as exc:
         fail(f"failed to write config file {path}: {exc}")
-
-
-def prompt_api_credentials() -> tuple[str, str]:
-    print("Telegram API credentials are required for downloading files from Telegram.")
-    print("Get them at https://my.telegram.org/apps")
-    try:
-        api_id = input("API ID: ").strip()
-        api_hash = input("API hash: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        fail("aborted")
-    if not api_id or not api_hash:
-        fail("API ID and hash are required")
-    if not api_id.isdigit():
-        fail("API ID must be a number")
-    return api_id, api_hash
-
-
-def _first_nonempty(*values: str | None) -> str | None:
-    for v in values:
-        if v:
-            return v
-    return None
-
-
-async def download_with_telethon(
-    channel: str,
-    asset: Asset,
-    destination: Path,
-    api_id: str | None,
-    api_hash: str | None,
-    session: str,
-) -> Path:
-    if not api_id:
-        api_id = os.environ.get("TELEGRAM_API_ID")
-    if not api_hash:
-        api_hash = os.environ.get("TELEGRAM_API_HASH")
-    if not api_id or not api_hash:
-        fail(
-            "download requires Telegram API credentials.\n"
-            "  Set them in ~/.config/sing-box-ref1nd-updater/config.json:\n"
-            '    {"api_id": 12345, "api_hash": "your_hash"}\n'
-            "  Or use env vars: TELEGRAM_API_ID / TELEGRAM_API_HASH\n"
-            "  Or pass --api-id / --api-hash"
-        )
-    try:
-        from telethon import TelegramClient  # type: ignore
-    except ImportError:
-        fail(
-            "Telethon is required for download.\n"
-            "  pip:      python3 -m pip install telethon\n"
-            "  Debian/Ubuntu: sudo apt install python3-telethon"
-        )
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(
-        session, int(api_id), api_hash,
-        device_model="sing-box-ref1nd-updater",
-        system_version="Linux",
-        app_version="1.0",
-    )
-    await client.start()
-    try:
-        entity = await client.get_entity(channel)
-        message = await client.get_messages(entity, ids=asset.message_id)
-        if not message or not getattr(message, "file", None):
-            fail(f"Telegram message {asset.message_id} has no downloadable file")
-        remote_name = getattr(message.file, "name", None)
-        if remote_name and remote_name != asset.filename:
-            fail(f"message file mismatch: expected {asset.filename}, got {remote_name}")
-        downloaded = await client.download_media(message, file=str(destination))
-    finally:
-        await client.disconnect()
-    if not downloaded:
-        fail("Telethon did not return a downloaded file path")
-    return Path(downloaded)
 
 
 def extract_binary(archive: Path, output: Path) -> tuple[Path, Path | None]:
@@ -416,23 +375,142 @@ def install_library(library: Path, install_path: Path) -> None:
             pass
 
 
+def _used_ports() -> set[int]:
+    ports: set[int] = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(name) as fh:
+                next(fh)  # skip header
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    local = parts[1]
+                    hex_port = local.split(":", 1)[-1]
+                    ports.add(int(hex_port, 16))
+        except (OSError, ValueError):
+            pass
+    return ports
+
+
+def _random_free_port() -> int:
+    used = _used_ports()
+    candidates = [p for p in range(10000, 60001) if p not in used]
+    if not candidates:
+        fail("no free port available in range 10000-60000")
+    return secrets.choice(candidates)
+
+
+def do_install(install_path: Path) -> None:
+    if os.geteuid() != 0:
+        fail("--install requires root privileges; run with sudo")
+
+    try:
+        pwd.getpwnam(SERVICE_USER)
+        log(f"User {SERVICE_USER} already exists")
+    except KeyError:
+        subprocess.run(
+            [
+                "useradd", "-r", "-s", SERVICE_SHELL,
+                "-d", "/", "-c", "sing-box reF1nd Service",
+                SERVICE_USER,
+            ],
+            check=True,
+        )
+        log(f"Created user {SERVICE_USER}")
+
+    for d in (SERVICE_STATE_DIR, SERVICE_CONFIG_DIR):
+        Path(d).mkdir(parents=True, exist_ok=True)
+    shutil.chown(SERVICE_STATE_DIR, SERVICE_USER, SERVICE_USER)
+
+    config_file = Path(SERVICE_CONFIG_DIR) / "config.json"
+    if not config_file.is_file():
+        psk = secrets.token_urlsafe(15)
+        port = _random_free_port()
+        cfg = dict(DEFAULT_SINGBOX_CONFIG)
+        cfg["inbounds"][0]["psk"] = psk
+        cfg["inbounds"][0]["listen_port"] = port
+        with config_file.open("w") as fh:
+            json.dump(cfg, fh, indent=2)
+            fh.write("\n")
+        config_file.chmod(0o644)
+        log(f"Created {config_file} with random PSK on port {port}")
+    else:
+        log(f"{config_file} already exists, skipping")
+
+    unit_content = f"""[Unit]
+Description=sing-box reF1nd service
+Documentation=https://github.com/reF1nd/sing-box
+After=network.target nss-lookup.target network-online.target
+
+[Service]
+User={SERVICE_USER}
+StateDirectory=sing-box-ref1nd
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart={install_path} -D {SERVICE_STATE_DIR} -C {SERVICE_CONFIG_DIR} run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    template_content = f"""[Unit]
+Description=sing-box reF1nd service
+Documentation=https://github.com/reF1nd/sing-box
+After=network.target nss-lookup.target network-online.target
+
+[Service]
+User={SERVICE_USER}
+StateDirectory=sing-box-ref1nd-%i
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart={install_path} -D {SERVICE_STATE_DIR}-%i -C {SERVICE_CONFIG_DIR}/%i.json run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    for path, content in ((SERVICE_UNIT, unit_content), (SERVICE_TEMPLATE, template_content)):
+        Path(path).write_text(content)
+        Path(path).chmod(0o644)
+        log(f"Created {path}")
+
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    log("systemd daemon-reload done")
+    log(f"Run: systemctl enable --now sing-box-ref1nd")
+
+
+def _first_nonempty(*values: Any) -> str | None:
+    for v in values:
+        if v:
+            return str(v)
+    return None
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Update sing-box reF1nd from Telegram releases")
+    parser = argparse.ArgumentParser(description="Update sing-box reF1nd from GitHub Releases")
     parser.add_argument("--track", choices=("stable", "testing"), default=None)
     parser.add_argument("--arch", choices=("auto", "arm64", "amd64v3", "amd64"), default=None)
     parser.add_argument("--build", choices=("purego", "musl", "glibc"), default=None)
-    parser.add_argument("--channel", default=None, help="Telegram channel name or https://t.me/... URL")
+    parser.add_argument("--repo", default=None, help="GitHub repo (default: reF1nd/sing-box-releases)")
     parser.add_argument("--install-path", default=None)
-    parser.add_argument("--max-pages", type=int, default=5, help="Telegram search result pages to scan")
-    parser.add_argument("--api-id", help="Telegram API ID; can also use TELEGRAM_API_ID")
-    parser.add_argument("--api-hash", help="Telegram API hash; can also use TELEGRAM_API_HASH")
-    parser.add_argument("--session", default=None, help="Telethon session file")
+    parser.add_argument("--max-pages", type=int, default=3, help="GitHub API result pages to scan")
+    parser.add_argument("--token", help="GitHub personal access token; can also use GITHUB_TOKEN env var")
     parser.add_argument("--config", default=None, help=f"config file path (default: {CONFIG_PATH})")
     parser.add_argument("--force", action="store_true", help="download and install even when not newer")
     parser.add_argument("--dry-run", action="store_true", help="check only; do not download or install")
     parser.add_argument("--list", action="store_true", help="list matching assets and exit")
-    parser.add_argument("--no-backup", action="store_true", help="do not save existing binary as sing-box.bak")
+    parser.add_argument("--no-backup", action="store_true", help="do not save existing binary as .bak")
     parser.add_argument("--skip-verify-binary", action="store_true", help="skip running downloaded binary before install")
+    parser.add_argument("--install", action="store_true", help="set up system service (user, dirs, config, systemd units)")
     return parser.parse_args()
 
 
@@ -440,31 +518,29 @@ def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
     config_path = Path(args.config or CONFIG_PATH)
-    channel = normalize_channel(_first_nonempty(args.channel, cfg.get("channel"), CHANNEL) or CHANNEL)
+
+    repo = normalize_repo(_first_nonempty(args.repo, cfg.get("repo"), REPO))
     arch = _first_nonempty(args.arch, cfg.get("arch")) or "auto"
     arch = detect_arch() if arch == "auto" else arch
     build = _first_nonempty(args.build, cfg.get("build")) or "musl"
     track = _first_nonempty(args.track, cfg.get("track")) or "stable"
     install_path = Path(_first_nonempty(args.install_path, cfg.get("install_path")) or INSTALL_PATH)
-    api_id = _first_nonempty(args.api_id, cfg.get("api_id"), os.environ.get("TELEGRAM_API_ID"))
-    api_hash = _first_nonempty(args.api_hash, cfg.get("api_hash"), os.environ.get("TELEGRAM_API_HASH"))
-    session = _first_nonempty(args.session, cfg.get("session")) or SESSION_PATH
-
-    need_credentials = not args.list and not args.dry_run and (not api_id or not api_hash)
-    if need_credentials:
-        api_id_str, api_hash = prompt_api_credentials()
-        api_id = api_id_str
+    token = _first_nonempty(args.token, cfg.get("token"), os.environ.get("GITHUB_TOKEN"))
 
     resolved = {
-        "api_id": api_id,
-        "api_hash": api_hash,
         "track": track,
         "arch": arch,
         "build": build,
     }
+    if token:
+        resolved["token"] = token
+    if repo != REPO:
+        resolved["repo"] = repo
+    if str(install_path) != INSTALL_PATH:
+        resolved["install_path"] = str(install_path)
+
     should_save = (
-        need_credentials
-        or not config_path.is_file()
+        not config_path.is_file()
         or (not args.list and not args.dry_run)
     )
     config_changed = not config_path.is_file() or any(
@@ -475,17 +551,20 @@ def main() -> int:
         write_config(merged, str(config_path))
         log(f"Config saved to {config_path}")
 
-    log(f"Scanning @{channel} #{track} for linux-{arch}-{build} ...")
-    assets = discover_assets(channel, track, args.max_pages)
-    matching = sorted(
-        [a for a in assets if a.arch == arch and a.build == build],
-        key=functools.cmp_to_key(lambda a, b: compare_versions(a.version, b.version)),
-        reverse=True,
-    )
     if args.list:
+        log(f"Discovering releases from {repo} for linux-{arch}-{build} ...")
+        assets = discover_assets(repo, args.max_pages, token)
+        matching = sorted(
+            [a for a in assets if a.arch == arch and a.build == build],
+            key=functools.cmp_to_key(lambda a, b: compare_versions(a.version, b.version)),
+            reverse=True,
+        )
         for asset in matching:
-            print(f"{asset.version}\t{asset.filename}\t{asset.message_url}")
+            print(f"{asset.version}\t{asset.filename}\t{asset.release_url}")
         return 0
+
+    log(f"Discovering releases from {repo} ({track}) for linux-{arch}-{build} ...")
+    assets = discover_assets(repo, args.max_pages, token)
 
     asset = latest_asset(assets, track, arch, build)
     if not asset:
@@ -493,9 +572,10 @@ def main() -> int:
 
     installed = current_version(install_path)
     log(f"Latest:   {asset.version} ({asset.filename})")
+    log(f"Release:  {asset.release_url}")
     log(f"Current:  {installed or 'not installed / unknown'}")
 
-    should_install = args.force or installed is None or compare_versions(asset.version, installed) > 0
+    should_install = args.force or args.install or installed is None or compare_versions(asset.version, installed) > 0
     if not should_install:
         if compare_versions(asset.version, installed) == 0:
             log("Already up to date.")
@@ -504,25 +584,31 @@ def main() -> int:
         return 0
     if args.dry_run:
         log(f"Would install {asset.version} to {install_path}")
+        if args.install:
+            log("Would set up systemd service (user, dirs, config, units)")
         return 0
 
-    with tempfile.TemporaryDirectory(prefix="sing-box-ref1nd-") as tmp:
-        tmpdir = Path(tmp)
-        archive_path = tmpdir / asset.filename
-        log(f"Downloading: {asset.message_url}")
-        downloaded = asyncio.run(
-            download_with_telethon(channel, asset, archive_path, api_id, api_hash, session)
-        )
-        binary_path = tmpdir / "sing-box"
-        _, libcronet_path = extract_binary(downloaded, binary_path)
-        if not args.skip_verify_binary:
-            verify_binary(binary_path, asset.version)
-        install_binary(binary_path, install_path, backup=not args.no_backup)
-        if libcronet_path is not None:
-            install_library(libcronet_path, Path(CRONET_LIB_PATH) / "libcronet.so")
-            log(f"Installed libcronet.so to {CRONET_LIB_PATH}")
+    if installed is None or compare_versions(asset.version, installed) > 0 or args.force:
+        with tempfile.TemporaryDirectory(prefix="sing-box-ref1nd-") as tmp:
+            tmpdir = Path(tmp)
+            archive_path = tmpdir / asset.filename
+            log(f"Downloading {asset.download_url}")
+            download_asset(asset, archive_path, token)
+            binary_path = tmpdir / "sing-box"
+            _, libcronet_path = extract_binary(archive_path, binary_path)
+            if not args.skip_verify_binary:
+                verify_binary(binary_path, asset.version)
+            install_binary(binary_path, install_path, backup=not args.no_backup)
+            if libcronet_path is not None:
+                install_library(libcronet_path, Path(CRONET_LIB_PATH) / "libcronet.so")
+                log(f"Installed libcronet.so to {CRONET_LIB_PATH}")
+        log(f"Installed {asset.version} to {install_path}")
+    elif args.install:
+        log("Binary already up to date, skipping download")
 
-    log(f"Installed {asset.version} to {install_path}")
+    if args.install:
+        do_install(install_path)
+
     return 0
 
 
