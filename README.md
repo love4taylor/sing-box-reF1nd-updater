@@ -18,6 +18,20 @@ sudo ./sing-box-ref1nd-updater.py --install
 sudo ./sing-box-ref1nd-updater.py
 ```
 
+### What `--install` creates
+
+| Path | Description |
+|---|---|
+| `/usr/local/bin/sing-box-ref1nd` | Binary |
+| `/usr/local/lib/cronet-go/libcronet.so` | Optional library (purego build only) |
+| `/usr/local/etc/sing-box-ref1nd/config.json` | sing-box config (auto-generated) |
+| `/var/lib/sing-box-ref1nd/` | State directory |
+| `/etc/systemd/system/sing-box-ref1nd.service` | Systemd service |
+| `/etc/systemd/system/sing-box-ref1nd@.service` | Systemd template |
+| `~/.config/sing-box-ref1nd-updater/config.json` | Updater config |
+
+Also creates `sing-box-ref1nd` system user (`/usr/sbin/nologin`).
+
 On first run, settings are saved to `~/.config/sing-box-ref1nd-updater/config.json`. You can also create it manually to override defaults:
 
 ```json
