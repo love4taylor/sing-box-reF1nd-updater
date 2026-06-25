@@ -157,6 +157,7 @@ def detect_arch() -> str:
 
 
 def discover_assets(repo: str, max_pages: int, token: str | None = None) -> list[Asset]:
+    # key: (upstream_version, rebuild_number, arch, build)
     seen: dict[tuple[str, int, str, str], Asset] = {}
     per_page = 100
     for page in range(1, max_pages + 1):
@@ -264,9 +265,7 @@ def latest_asset(assets: Iterable[Asset], track: str, arch: str, build: str) -> 
         filtered = [a for a in filtered if TESTING_RE.search(a.version)]
     if not filtered:
         return None
-    return max(filtered, key=functools.cmp_to_key(
-        lambda a, b: compare_asset_versions(a, b)
-    ))
+    return max(filtered, key=ASSET_VERSION_KEY)
 
 
 def compare_asset_versions(a: Asset, b: Asset) -> int:
@@ -276,6 +275,9 @@ def compare_asset_versions(a: Asset, b: Asset) -> int:
     if a.rebuild != b.rebuild:
         return 1 if a.rebuild > b.rebuild else -1
     return 0
+
+
+ASSET_VERSION_KEY = functools.cmp_to_key(compare_asset_versions)
 
 
 def current_version(binary: Path) -> str | None:
@@ -578,9 +580,7 @@ def main() -> int:
         assets = discover_assets(repo, args.max_pages, token)
         matching = sorted(
             [a for a in assets if a.arch == arch and a.build == build],
-            key=functools.cmp_to_key(
-                lambda a, b: compare_asset_versions(a, b)
-            ),
+            key=ASSET_VERSION_KEY,
             reverse=True,
         )
         for asset in matching:
@@ -595,13 +595,28 @@ def main() -> int:
         fail(f"no matching {track} linux-{arch}-{build} asset found")
 
     installed = current_version(install_path)
+    tracked_version = cfg.get("installed_version")
     log(f"Latest:   {asset.display_version()} ({asset.filename})")
     log(f"Release:  {asset.release_url}")
-    log(f"Current:  {installed or 'not installed / unknown'}")
+    log(f"Current:  {tracked_version or installed or 'not installed / unknown'}")
 
-    should_install = args.force or args.install or installed is None or compare_versions(asset.version, installed) > 0
+    if tracked_version:
+        # Compare against the full tracked version (includes rebuild)
+        should_install = (
+            args.force or args.install
+            or compare_versions(asset.display_version(), tracked_version) > 0
+        )
+    elif installed is not None:
+        should_install = (
+            args.force or args.install
+            or compare_versions(asset.version, installed) > 0
+        )
+    else:
+        should_install = True
     if not should_install:
-        if compare_versions(asset.version, installed) == 0:
+        if tracked_version and compare_versions(asset.display_version(), tracked_version) == 0:
+            log("Already up to date.")
+        elif installed is not None and compare_versions(asset.version, installed) == 0:
             log("Already up to date.")
         else:
             log("Installed version is newer than selected channel asset. Use --force to install anyway.")
@@ -612,7 +627,13 @@ def main() -> int:
             log("Would set up systemd service (user, dirs, config, units)")
         return 0
 
-    if installed is None or compare_versions(asset.version, installed) > 0 or args.force:
+    if installed is None or args.force or (
+        tracked_version
+        and compare_versions(asset.display_version(), tracked_version) > 0
+    ) or (
+        not tracked_version and installed is not None
+        and compare_versions(asset.version, installed) > 0
+    ):
         with tempfile.TemporaryDirectory(prefix="sing-box-ref1nd-") as tmp:
             tmpdir = Path(tmp)
             archive_path = tmpdir / asset.filename
@@ -627,6 +648,9 @@ def main() -> int:
                 install_library(libcronet_path, Path(CRONET_LIB_PATH) / "libcronet.so")
                 log(f"Installed libcronet.so to {CRONET_LIB_PATH}")
         log(f"Installed {asset.display_version()} to {install_path}")
+        cfg["installed_version"] = asset.display_version()
+        merged = {**cfg, **{k: v for k, v in resolved.items() if v}}
+        write_config(merged, str(config_path))
     elif args.install:
         log("Binary already up to date, skipping download")
 
