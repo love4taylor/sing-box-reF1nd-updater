@@ -59,7 +59,7 @@ DEFAULT_SINGBOX_CONFIG = {
 }
 
 ASSET_RE = re.compile(
-    r"^sing-box-(?P<version>.+?)-reF1nd-linux-"
+    r"^sing-box-(?P<version>.+?)-reF1nd(?P<rebuild>\.[0-9]+)?-linux-"
     r"(?P<arch>arm64|amd64v3|amd64)-(?P<build>purego|musl|glibc)\.tar\.gz$"
 )
 CURRENT_VERSION_RE = re.compile(r"sing-box\s+version\s+(?P<version>\S+)")
@@ -78,8 +78,14 @@ class Asset:
     version: str
     arch: str
     build: str
-    download_url: str
-    release_url: str
+    rebuild: int = 0
+    download_url: str = ""
+    release_url: str = ""
+
+    def display_version(self) -> str:
+        if self.rebuild:
+            return f"{self.version}-reF1nd.{self.rebuild}"
+        return self.version
 
 
 def log(message: str) -> None:
@@ -151,7 +157,7 @@ def detect_arch() -> str:
 
 
 def discover_assets(repo: str, max_pages: int, token: str | None = None) -> list[Asset]:
-    seen: dict[tuple[str, str, str], Asset] = {}
+    seen: dict[tuple[str, int, str, str], Asset] = {}
     per_page = 100
     for page in range(1, max_pages + 1):
         url = f"https://api.github.com/repos/{repo}/releases?per_page={per_page}&page={page}"
@@ -167,17 +173,22 @@ def discover_assets(repo: str, max_pages: int, token: str | None = None) -> list
                 match = ASSET_RE.match(filename)
                 if not match:
                     continue
+                full_version = match.group("version")
+                rebuild_str = match.group("rebuild")
+                rebuild = int(rebuild_str.lstrip(".")) if rebuild_str else 0
                 key = (
-                    match.group("version"),
+                    full_version,
+                    rebuild,
                     match.group("arch"),
                     match.group("build"),
                 )
                 if key not in seen:
                     seen[key] = Asset(
                         filename=filename,
-                        version=match.group("version"),
+                        version=full_version,
                         arch=match.group("arch"),
                         build=match.group("build"),
+                        rebuild=rebuild,
                         download_url=asset_data["browser_download_url"],
                         release_url=release_url,
                     )
@@ -253,7 +264,18 @@ def latest_asset(assets: Iterable[Asset], track: str, arch: str, build: str) -> 
         filtered = [a for a in filtered if TESTING_RE.search(a.version)]
     if not filtered:
         return None
-    return max(filtered, key=functools.cmp_to_key(lambda a, b: compare_versions(a.version, b.version)))
+    return max(filtered, key=functools.cmp_to_key(
+        lambda a, b: compare_asset_versions(a, b)
+    ))
+
+
+def compare_asset_versions(a: Asset, b: Asset) -> int:
+    cmp = compare_versions(a.version, b.version)
+    if cmp != 0:
+        return cmp
+    if a.rebuild != b.rebuild:
+        return 1 if a.rebuild > b.rebuild else -1
+    return 0
 
 
 def current_version(binary: Path) -> str | None:
@@ -269,7 +291,7 @@ def current_version(binary: Path) -> str | None:
     if not match:
         return None
     version = match.group("version")
-    return version.removesuffix("-reF1nd")
+    return re.sub(r"-reF1nd(?:\.[0-9]+)?$", "", version)
 
 
 def load_config(config_path: str | None = None) -> dict[str, Any]:
@@ -556,11 +578,13 @@ def main() -> int:
         assets = discover_assets(repo, args.max_pages, token)
         matching = sorted(
             [a for a in assets if a.arch == arch and a.build == build],
-            key=functools.cmp_to_key(lambda a, b: compare_versions(a.version, b.version)),
+            key=functools.cmp_to_key(
+                lambda a, b: compare_asset_versions(a, b)
+            ),
             reverse=True,
         )
         for asset in matching:
-            print(f"{asset.version}\t{asset.filename}\t{asset.release_url}")
+            print(f"{asset.display_version()}\t{asset.filename}\t{asset.release_url}")
         return 0
 
     log(f"Discovering releases from {repo} ({track}) for linux-{arch}-{build} ...")
@@ -571,7 +595,7 @@ def main() -> int:
         fail(f"no matching {track} linux-{arch}-{build} asset found")
 
     installed = current_version(install_path)
-    log(f"Latest:   {asset.version} ({asset.filename})")
+    log(f"Latest:   {asset.display_version()} ({asset.filename})")
     log(f"Release:  {asset.release_url}")
     log(f"Current:  {installed or 'not installed / unknown'}")
 
@@ -583,7 +607,7 @@ def main() -> int:
             log("Installed version is newer than selected channel asset. Use --force to install anyway.")
         return 0
     if args.dry_run:
-        log(f"Would install {asset.version} to {install_path}")
+        log(f"Would install {asset.display_version()} to {install_path}")
         if args.install:
             log("Would set up systemd service (user, dirs, config, units)")
         return 0
@@ -602,7 +626,7 @@ def main() -> int:
             if libcronet_path is not None:
                 install_library(libcronet_path, Path(CRONET_LIB_PATH) / "libcronet.so")
                 log(f"Installed libcronet.so to {CRONET_LIB_PATH}")
-        log(f"Installed {asset.version} to {install_path}")
+        log(f"Installed {asset.display_version()} to {install_path}")
     elif args.install:
         log("Binary already up to date, skipping download")
 
