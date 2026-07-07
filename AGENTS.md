@@ -20,17 +20,17 @@
 
 ## File Map
 ```
-sing-box-ref1nd-updater.py   — Single-file (617 lines): GitHub Release fetcher, binary installer, systemd setup
+sing-box-ref1nd-updater.py   — Single-file (693 lines): GitHub Release fetcher, binary installer, systemd setup
 README.md / LICENSE          — Docs, MIT
 ```
 
 ## Golden Samples
 | For | Reference | Key patterns |
 |-----|-----------|--------------|
-| CLI parsing | `parse_args` L498-514 | argparse, --flag style |
-| GitHub API | `request_json` L94-118 | urllib.request, token, rate-limit |
-| Semver | `semver_key`/`compare_versions` L202-246 | Tuple sort, prerelease ordering |
-| Safe install | `install_binary` L340-359 | Atomic os.replace, .bak backup |
+| CLI parsing | `parse_args` L544-560 | argparse, --flag style |
+| GitHub API | `request_json` L97-120 | urllib.request, token, rate-limit |
+| Semver | `semver_key`/`compare_versions` L218-261 | Tuple sort, prerelease ordering |
+| Safe install | `install_binary` L379-397 | Atomic os.replace, .bak backup |
 
 ## Heuristics & Boundaries
 - **Always**: syntax-check before commit; `--dry-run` before sudo; keep zero-dependency; read full file before editing. When adding CLI flags → use argparse in `parse_args()`; changing defaults → update L27-41 constants.
@@ -38,7 +38,7 @@ README.md / LICENSE          — Docs, MIT
 - **Never**: commit credentials; use pip/pypi; touch `.codegraph/` or `__pycache__/`.
 
 ## Codebase State & Terminology
-No CI/CD, no test suite. Single-file (617 lines), Python 3.9+ stdlib only, Linux-targeted (systemd). `track`=release channel, `arch`=CPU, `build`=C library variant.
+No CI/CD, no test suite. Single-file (693 lines), Python 3.9+ stdlib only, Linux-targeted (systemd). `track`=release channel, `arch`=CPU, `build`=C library variant.
 
 ## Scoped AGENTS.md
 No subdirectories — this is the only AGENTS.md in the project.

@@ -12,7 +12,6 @@ import pwd
 import re
 import secrets
 import shutil
-import stat
 import subprocess
 import sys
 import tarfile
@@ -83,9 +82,7 @@ class Asset:
     release_url: str = ""
 
     def display_version(self) -> str:
-        if self.rebuild:
-            return f"{self.version}-reF1nd.{self.rebuild}"
-        return self.version
+        return f"{self.version}-reF1nd.{self.rebuild}"
 
 
 def log(message: str) -> None:
@@ -160,11 +157,13 @@ def discover_assets(repo: str, max_pages: int, token: str | None = None) -> list
     # key: (upstream_version, rebuild_number, arch, build)
     seen: dict[tuple[str, int, str, str], Asset] = {}
     per_page = 100
+    last_page_count = 0
     for page in range(1, max_pages + 1):
         url = f"https://api.github.com/repos/{repo}/releases?per_page={per_page}&page={page}"
         releases = request_json(url, token)
         if not releases:
             break
+        last_page_count = len(releases)
         for release in releases:
             if release.get("draft"):
                 continue
@@ -193,6 +192,11 @@ def discover_assets(repo: str, max_pages: int, token: str | None = None) -> list
                         download_url=asset_data["browser_download_url"],
                         release_url=release_url,
                     )
+    if last_page_count == per_page and not seen:
+        log(
+            f"Warning: scanned {max_pages} pages of releases without finding matching assets. "
+            f"Try increasing --max-pages if the expected asset exists in older releases."
+        )
     return list(seen.values())
 
 
@@ -280,6 +284,16 @@ def compare_asset_versions(a: Asset, b: Asset) -> int:
 ASSET_VERSION_KEY = functools.cmp_to_key(compare_asset_versions)
 
 
+def compare_display_versions(left: str, right: str) -> int:
+    """Compare two display version strings such as '1.11.0-reF1nd.2'.
+
+    This is the string-level equivalent of compare_asset_versions, used when
+    only the display string is available (e.g. comparing against a
+    tracked_version stored in the config file).
+    """
+    return compare_versions(left, right)
+
+
 def current_version(binary: Path) -> str | None:
     if not binary.exists():
         return None
@@ -314,6 +328,7 @@ def write_config(data: dict[str, Any], config_path: str | None = None) -> None:
         with path.open("w") as fh:
             json.dump(data, fh, indent=4)
             fh.write("\n")
+        path.chmod(0o600)
     except OSError as exc:
         fail(f"failed to write config file {path}: {exc}")
 
@@ -368,7 +383,7 @@ def install_binary(binary: Path, install_path: Path, backup: bool) -> None:
     tmp_target = install_dir / f".{install_path.name}.new.{os.getpid()}"
     try:
         shutil.copy2(binary, tmp_target)
-        tmp_target.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        tmp_target.chmod(0o755)
         if backup and install_path.exists():
             backup_path = install_dir / f"{install_path.name}.bak"
             shutil.copy2(install_path, backup_path)
@@ -418,6 +433,9 @@ def _used_ports() -> set[int]:
 
 
 def _random_free_port() -> int:
+    # NOTE: there is an inherent TOCTOU race here — another process may bind
+    # the port between this check and when sing-box starts.  In practice this
+    # is unlikely because the script runs once during setup.
     used = _used_ports()
     candidates = [p for p in range(10000, 60001) if p not in used]
     if not candidates:
@@ -503,8 +521,12 @@ WantedBy=multi-user.target
 """
 
     for path, content in ((SERVICE_UNIT, unit_content), (SERVICE_TEMPLATE, template_content)):
-        Path(path).write_text(content)
-        Path(path).chmod(0o644)
+        unit_path = Path(path)
+        if unit_path.exists():
+            log(f"Skipping {path}: already exists (remove manually to regenerate)")
+            continue
+        unit_path.write_text(content)
+        unit_path.chmod(0o644)
         log(f"Created {path}")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
@@ -536,6 +558,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-verify-binary", action="store_true", help="skip running downloaded binary before install")
     parser.add_argument("--install", action="store_true", help="set up system service (user, dirs, config, systemd units)")
     return parser.parse_args()
+
+
+def _save_resolved_config(cfg: dict[str, Any], resolved: dict[str, Any], config_path: Path, installed_version: str | None = None) -> None:
+    """Merge resolved settings into cfg and write to disk."""
+    if installed_version is not None:
+        cfg["installed_version"] = installed_version
+    merged = {**cfg, **{k: v for k, v in resolved.items() if v}}
+    write_config(merged, str(config_path))
+    log(f"Config saved to {config_path}")
 
 
 def main() -> int:
@@ -571,9 +602,7 @@ def main() -> int:
         str(resolved.get(k)) != str(cfg.get(k)) for k in resolved
     )
     if should_save and config_changed:
-        merged = {**cfg, **{k: v for k, v in resolved.items() if v}}
-        write_config(merged, str(config_path))
-        log(f"Config saved to {config_path}")
+        _save_resolved_config(cfg, resolved, config_path)
 
     if args.list:
         log(f"Discovering releases from {repo} for linux-{arch}-{build} ...")
@@ -604,7 +633,7 @@ def main() -> int:
         # Compare against the full tracked version (includes rebuild)
         should_install = (
             args.force or args.install
-            or compare_versions(asset.display_version(), tracked_version) > 0
+            or compare_display_versions(asset.display_version(), tracked_version) > 0
         )
     elif installed is not None:
         should_install = (
@@ -648,11 +677,11 @@ def main() -> int:
                 install_library(libcronet_path, Path(CRONET_LIB_PATH) / "libcronet.so")
                 log(f"Installed libcronet.so to {CRONET_LIB_PATH}")
         log(f"Installed {asset.display_version()} to {install_path}")
-        cfg["installed_version"] = asset.display_version()
-        merged = {**cfg, **{k: v for k, v in resolved.items() if v}}
-        write_config(merged, str(config_path))
+        _save_resolved_config(cfg, resolved, config_path, installed_version=asset.display_version())
     elif args.install:
         log("Binary already up to date, skipping download")
+        if not cfg.get("installed_version"):
+            _save_resolved_config(cfg, resolved, config_path, installed_version=asset.display_version())
 
     if args.install:
         do_install(install_path)
